@@ -1,0 +1,110 @@
+name: gophprofile
+
+x-app: &app
+  image: gophprofile:local
+  build: .
+  restart: unless-stopped
+  environment: &app-env
+    APP_MODE: production
+    HTTP_ADDR: :8080
+    DATABASE_URL: postgres://gophprofile:${POSTGRES_PASSWORD:-gophprofile_dev}@postgres:5432/gophprofile?sslmode=disable
+    KAFKA_BROKERS: kafka:9092
+    KAFKA_TOPIC: avatar-events
+    KAFKA_GROUP_ID: avatar-workers
+    S3_ENDPOINT: minio:9000
+    S3_ACCESS_KEY: ${MINIO_ROOT_USER:-gophprofile}
+    S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-gophprofile_dev_secret}
+    S3_BUCKET: avatars
+    S3_USE_SSL: "false"
+    CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+    RATE_LIMIT_REQUESTS: ${RATE_LIMIT_REQUESTS:-120}
+    RATE_LIMIT_WINDOW: ${RATE_LIMIT_WINDOW:-1m}
+  depends_on:
+    postgres:
+      condition: service_healthy
+    kafka:
+      condition: service_healthy
+    minio:
+      condition: service_started
+
+services:
+  server:
+    <<: *app
+    ports:
+      - "127.0.0.1:${HTTP_PORT:-8080}:8080"
+    healthcheck:
+      test: [CMD, /app/server, -healthcheck]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  worker:
+    <<: *app
+    entrypoint: [/app/worker]
+
+  postgres:
+    image: postgres:17.6-alpine
+    environment:
+      POSTGRES_USER: gophprofile
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gophprofile_dev}
+      POSTGRES_DB: gophprofile
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U gophprofile -d gophprofile"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: gophprofile-minio:local
+    build:
+      context: .
+      dockerfile: docker/minio.Dockerfile
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-gophprofile}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-gophprofile_dev_secret}
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - minio-data:/data
+
+  kafka:
+    image: apache/kafka:4.1.1
+    hostname: kafka
+    ports:
+      - "127.0.0.1:19092:19092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://:9092,EXTERNAL://:19092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:19092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_HEAP_OPTS: -Xms256m -Xmx512m
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: [CMD-SHELL, "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+
+volumes:
+  postgres-data:
+  minio-data:
+  kafka-data:
