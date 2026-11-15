@@ -2,6 +2,7 @@ package imageproc
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -35,7 +36,7 @@ func inspectHeader(data []byte) (domain.ImageInfo, error) {
 	}
 	config, format, err := image.DecodeConfig(bytes.NewReader(data))
 	if err != nil {
-		if err == image.ErrFormat {
+		if errors.Is(err, image.ErrFormat) {
 			return domain.ImageInfo{}, fmt.Errorf("decode image header: %w", domain.ErrUnsupported)
 		}
 		return domain.ImageInfo{}, fmt.Errorf("decode image header: %w: %v", domain.ErrInvalid, err)

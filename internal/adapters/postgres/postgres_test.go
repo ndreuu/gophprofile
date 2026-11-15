@@ -13,7 +13,6 @@ import (
 	"github.com/pashagolub/pgxmock/v4"
 
 	"gophprofile/internal/domain"
-	"gophprofile/migrations"
 )
 
 const testAvatarID = "cfa7d924-00c1-4d09-bde9-9c625b31f1cd"
@@ -385,31 +384,33 @@ func TestDispatchEmptyOutboxDoesNotPublish(t *testing.T) {
 	}
 }
 
-func TestMigrateLocksSchemaAndAppliesOnlyOnce(t *testing.T) {
-	for _, applied := range []bool{false, true} {
-		t.Run(map[bool]string{false: "first run", true: "already applied"}[applied], func(t *testing.T) {
-			repo, mock := repositoryMock(t)
-			mock.ExpectBegin()
-			mock.ExpectExec("SELECT pg_advisory_xact_lock").WithArgs(int64(4815162342)).
-				WillReturnResult(pgxmock.NewResult("SELECT", 1))
-			mock.ExpectExec("CREATE TABLE IF NOT EXISTS schema_migrations").
-				WillReturnResult(pgxmock.NewResult("CREATE TABLE", 0))
-			mock.ExpectQuery("SELECT EXISTS").WithArgs("001_initial.sql").WillReturnRows(
-				pgxmock.NewRows([]string{"exists"}).AddRow(applied))
-			if !applied {
-				source, _ := migrations.Files.ReadFile("001_initial.sql")
-				mock.ExpectExec("CREATE TABLE avatars").WillReturnResult(pgxmock.NewResult("CREATE TABLE", 0))
-				if !strings.Contains(string(source), "processed_messages") {
-					t.Fatal("migration must include durable inbox")
-				}
-				mock.ExpectExec("INSERT INTO schema_migrations").WithArgs("001_initial.sql").
-					WillReturnResult(pgxmock.NewResult("INSERT", 1))
-			}
-			mock.ExpectCommit()
-			if err := repo.Migrate(context.Background()); err != nil {
-				t.Fatal(err)
-			}
-		})
+func TestMigrateDelegatesWithCallerContext(t *testing.T) {
+	type contextKey struct{}
+	ctx := context.WithValue(context.Background(), contextKey{}, "startup")
+	calls := 0
+	repo := &Repository{migrate: func(got context.Context) error {
+		calls++
+		if got != ctx || got.Value(contextKey{}) != "startup" {
+			t.Fatal("migration lost the startup context")
+		}
+		return nil
+	}}
+	if err := repo.Migrate(ctx); err != nil || calls != 1 {
+		t.Fatalf("calls=%d err=%v", calls, err)
+	}
+}
+
+func TestMigratePreservesFailureForStartup(t *testing.T) {
+	failure := errors.New("schema upgrade rejected")
+	repo := &Repository{migrate: func(context.Context) error { return failure }}
+	if err := repo.Migrate(context.Background()); !errors.Is(err, failure) {
+		t.Fatalf("migration failure was swallowed: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	repo.migrate = func(ctx context.Context) error { return ctx.Err() }
+	if err := repo.Migrate(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("startup cancellation was swallowed: %v", err)
 	}
 }
 

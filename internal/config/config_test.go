@@ -30,8 +30,76 @@ func clearEnvironment(t *testing.T) {
 	}
 }
 
-func TestLoadDefaults(t *testing.T) {
+func setProductionCredentials(t *testing.T) {
+	t.Helper()
+	t.Setenv("DATABASE_URL", "postgresql://test-user@localhost:5432/gophprofile")
+	t.Setenv("S3_ACCESS_KEY", "test-access-key")
+	t.Setenv("S3_SECRET_KEY", "test-secret-key")
+}
+
+func TestProductionRequiresExplicitCredentials(t *testing.T) {
+	for _, key := range []string{"DATABASE_URL", "S3_ACCESS_KEY", "S3_SECRET_KEY"} {
+		for _, state := range []string{"missing", "empty", "whitespace"} {
+			t.Run(key+"/"+state, func(t *testing.T) {
+				clearEnvironment(t)
+				setProductionCredentials(t)
+				switch state {
+				case "missing":
+					if err := os.Unsetenv(key); err != nil {
+						t.Fatal(err)
+					}
+				case "empty":
+					t.Setenv(key, "")
+				case "whitespace":
+					t.Setenv(key, " \t")
+				}
+				_, err := Load()
+				if err == nil || !strings.Contains(err.Error(), key) || !strings.Contains(err.Error(), "must be set and non-empty") {
+					t.Fatalf("expected clear missing %s error, got %v", key, err)
+				}
+				if strings.Contains(err.Error(), "test-secret-key") || strings.Contains(err.Error(), "test-access-key") {
+					t.Fatal("configuration error disclosed a credential")
+				}
+			})
+		}
+	}
+}
+
+func TestDemoDoesNotRequireExternalCredentials(t *testing.T) {
+	for _, empty := range []bool{false, true} {
+		t.Run(map[bool]string{false: "missing", true: "empty"}[empty], func(t *testing.T) {
+			clearEnvironment(t)
+			t.Setenv("APP_MODE", "demo")
+			if empty {
+				for _, key := range []string{"DATABASE_URL", "S3_ACCESS_KEY", "S3_SECRET_KEY"} {
+					t.Setenv(key, "")
+				}
+			}
+			cfg, err := Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.AppMode != "demo" || cfg.DatabaseURL != "" || cfg.S3AccessKey != "" || cfg.S3SecretKey != "" {
+				t.Fatalf("demo must not invent external credentials: %+v", cfg)
+			}
+		})
+	}
+}
+
+func TestDemoSkipsUnusedDatabaseAndS3Validation(t *testing.T) {
 	clearEnvironment(t)
+	t.Setenv("APP_MODE", "demo")
+	t.Setenv("DATABASE_URL", "unused")
+	t.Setenv("S3_ENDPOINT", "unused")
+	t.Setenv("S3_BUCKET", "")
+	if _, err := Load(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadProductionWithExplicitCredentials(t *testing.T) {
+	clearEnvironment(t)
+	setProductionCredentials(t)
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
@@ -40,10 +108,10 @@ func TestLoadDefaults(t *testing.T) {
 		cfg.S3Endpoint != "localhost:9000" || cfg.S3Bucket != "avatars" || cfg.S3UseSSL ||
 		cfg.KafkaTopic != "avatar-events" || cfg.KafkaGroupID != "avatar-workers" ||
 		!reflect.DeepEqual(cfg.KafkaBrokers, []string{"localhost:19092"}) ||
-		cfg.S3AccessKey != "gophprofile" || cfg.S3SecretKey != "gophprofile_dev_secret" ||
+		cfg.S3AccessKey != "test-access-key" || cfg.S3SecretKey != "test-secret-key" ||
 		cfg.WorkerRetryAttempts != 3 || cfg.WorkerRetryBaseDelay != 500*time.Millisecond ||
 		cfg.WorkerRetryMaxDelay != 10*time.Second || cfg.ShutdownTimeout != 10*time.Second ||
-		cfg.OutboxPollInterval != 250*time.Millisecond || !strings.HasPrefix(cfg.DatabaseURL, "postgres://") {
+		cfg.OutboxPollInterval != 250*time.Millisecond || cfg.DatabaseURL != "postgresql://test-user@localhost:5432/gophprofile" {
 		t.Fatalf("unexpected defaults: %+v", cfg)
 	}
 	if cfg.AllowedOrigins != nil || cfg.RateLimitRequests != 120 || cfg.RateLimitWindow != time.Minute {
@@ -106,6 +174,7 @@ func TestLoadRejectsInvalidConfiguration(t *testing.T) {
 	} {
 		t.Run(test.key+"="+test.value, func(t *testing.T) {
 			clearEnvironment(t)
+			setProductionCredentials(t)
 			t.Setenv(test.key, test.value)
 			if _, err := Load(); err == nil || !strings.Contains(err.Error(), test.key) {
 				t.Fatalf("expected error mentioning %s, got %v", test.key, err)
@@ -116,6 +185,7 @@ func TestLoadRejectsInvalidConfiguration(t *testing.T) {
 
 func TestAllowedOriginsCanonicalizesAndDeduplicates(t *testing.T) {
 	clearEnvironment(t)
+	setProductionCredentials(t)
 	t.Setenv("CORS_ALLOWED_ORIGINS", "https://APP.example.com:443,https://app.example.com,http://localhost:80,http://[::1]:5173")
 	cfg, err := Load()
 	if err != nil {
@@ -129,6 +199,7 @@ func TestAllowedOriginsCanonicalizesAndDeduplicates(t *testing.T) {
 
 func TestAllowedOriginsEmptyKeepsSameOriginOnly(t *testing.T) {
 	clearEnvironment(t)
+	setProductionCredentials(t)
 	t.Setenv("CORS_ALLOWED_ORIGINS", "  ")
 	cfg, err := Load()
 	if err != nil || cfg.AllowedOrigins != nil {

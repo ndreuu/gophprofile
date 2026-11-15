@@ -86,7 +86,7 @@ func Open(ctx context.Context, cfg config.Config, withConsumer bool, logger *slo
 		resources.Publisher = publisher
 		resources.close = func() { publisher.Close(); repo.Close() }
 		if withConsumer {
-			c, err := kafka.NewConsumer(cfg.KafkaBrokers, cfg.KafkaTopic, cfg.KafkaGroupID)
+			c, err := kafka.NewConsumer(cfg.KafkaBrokers, cfg.KafkaTopic, cfg.KafkaGroupID, logger)
 			if err != nil {
 				resources.Close()
 				return nil, err

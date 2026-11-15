@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"image"
 	"image/color"
 	"image/jpeg"
 	"image/png"
+	"io"
 	"testing"
 
 	"gophprofile/internal/domain"
@@ -214,5 +216,17 @@ func TestConvertRejectsInvalidFormatOrInput(t *testing.T) {
 	data := encodedImage(t, 2, 2, "png")[:33]
 	if _, _, err := New().Convert(data, "webp"); !errors.Is(err, domain.ErrInvalid) {
 		t.Fatal(err)
+	}
+}
+
+func TestInspectRecognizesWrappedFormatError(t *testing.T) {
+	image.RegisterFormat("wrapped-format-error", "wrapped-format-error", func(io.Reader) (image.Image, error) {
+		return nil, fmt.Errorf("decoder: %w", image.ErrFormat)
+	}, func(io.Reader) (image.Config, error) {
+		return image.Config{}, fmt.Errorf("decoder: %w", image.ErrFormat)
+	})
+	_, err := New().Inspect([]byte("wrapped-format-error"))
+	if !errors.Is(err, domain.ErrUnsupported) {
+		t.Fatalf("wrapped format error must be unsupported, got %v", err)
 	}
 }

@@ -36,12 +36,12 @@ func Load() (Config, error) {
 	cfg := Config{
 		AppMode:             env("APP_MODE", "production"),
 		HTTPAddr:            env("HTTP_ADDR", ":8080"),
-		DatabaseURL:         env("DATABASE_URL", "postgres://gophprofile:gophprofile_dev@localhost:5432/gophprofile?sslmode=disable"),
+		DatabaseURL:         os.Getenv("DATABASE_URL"),
 		KafkaTopic:          env("KAFKA_TOPIC", "avatar-events"),
 		KafkaGroupID:        env("KAFKA_GROUP_ID", "avatar-workers"),
 		S3Endpoint:          env("S3_ENDPOINT", "localhost:9000"),
-		S3AccessKey:         env("S3_ACCESS_KEY", "gophprofile"),
-		S3SecretKey:         env("S3_SECRET_KEY", "gophprofile_dev_secret"),
+		S3AccessKey:         os.Getenv("S3_ACCESS_KEY"),
+		S3SecretKey:         os.Getenv("S3_SECRET_KEY"),
 		S3Bucket:            env("S3_BUCKET", "avatars"),
 		WorkerRetryAttempts: 3,
 		RateLimitRequests:   120,
@@ -62,19 +62,31 @@ func Load() (Config, error) {
 	if err := validAddress(cfg.HTTPAddr); err != nil {
 		return Config{}, fmt.Errorf("HTTP_ADDR: %w", err)
 	}
-	dsn, err := url.Parse(cfg.DatabaseURL)
-	if err != nil || (dsn.Scheme != "postgres" && dsn.Scheme != "postgresql") || dsn.Host == "" {
-		return Config{}, fmt.Errorf("DATABASE_URL must be a postgres:// or postgresql:// URL with a host")
-	}
-	if err := validAddress(cfg.S3Endpoint); err != nil {
-		return Config{}, fmt.Errorf("S3_ENDPOINT must be host:port without a URL scheme: %w", err)
-	}
-	if cfg.S3AccessKey == "" || cfg.S3SecretKey == "" || cfg.S3Bucket == "" {
-		return Config{}, fmt.Errorf("S3_ACCESS_KEY, S3_SECRET_KEY and S3_BUCKET must not be empty")
+	if cfg.AppMode == "production" {
+		for _, item := range []struct{ name, value string }{
+			{"DATABASE_URL", cfg.DatabaseURL},
+			{"S3_ACCESS_KEY", cfg.S3AccessKey},
+			{"S3_SECRET_KEY", cfg.S3SecretKey},
+		} {
+			if strings.TrimSpace(item.value) == "" {
+				return Config{}, fmt.Errorf("%s must be set and non-empty in production mode", item.name)
+			}
+		}
+		dsn, err := url.Parse(cfg.DatabaseURL)
+		if err != nil || (dsn.Scheme != "postgres" && dsn.Scheme != "postgresql") || dsn.Host == "" {
+			return Config{}, fmt.Errorf("DATABASE_URL must be a postgres:// or postgresql:// URL with a host")
+		}
+		if err := validAddress(cfg.S3Endpoint); err != nil {
+			return Config{}, fmt.Errorf("S3_ENDPOINT must be host:port without a URL scheme: %w", err)
+		}
+		if cfg.S3Bucket == "" {
+			return Config{}, fmt.Errorf("S3_BUCKET must not be empty")
+		}
 	}
 	if cfg.KafkaTopic == "" || cfg.KafkaGroupID == "" {
 		return Config{}, fmt.Errorf("KAFKA_TOPIC and KAFKA_GROUP_ID must not be empty")
 	}
+	var err error
 	cfg.AllowedOrigins, err = originEnv("CORS_ALLOWED_ORIGINS")
 	if err != nil {
 		return Config{}, err

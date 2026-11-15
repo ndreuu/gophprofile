@@ -21,6 +21,7 @@ jobs:
         with:
           version: v2.15.0
       - run: go build ./cmd/...
+      - run: cp .env.example .env
       - run: docker compose config -q
       - run: docker compose up --build -d --wait --wait-timeout 180
       - run: go test -race -tags=integration ./internal/adapters/postgres ./internal/adapters/s3

@@ -5,12 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
-	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
 
 	"gophprofile/internal/domain"
 	"gophprofile/migrations"
@@ -24,7 +23,10 @@ type database interface {
 	Close()
 }
 
-type Repository struct{ pool database }
+type Repository struct {
+	pool    database
+	migrate func(context.Context) error
+}
 
 var _ domain.Repository = (*Repository)(nil)
 var _ domain.Outbox = (*Repository)(nil)
@@ -38,7 +40,18 @@ func New(ctx context.Context, dsn string) (*Repository, error) {
 		pool.Close()
 		return nil, fmt.Errorf("connect PostgreSQL: %w", err)
 	}
-	return &Repository{pool: pool}, nil
+	return &Repository{
+		pool: pool,
+		migrate: func(ctx context.Context) error {
+			db := stdlib.OpenDBFromPool(pool)
+			defer func() { _ = db.Close() }()
+			if err := migrations.Up(ctx, db); err != nil {
+				return err
+			}
+			pool.Reset()
+			return nil
+		},
+	}, nil
 }
 
 // Close releases the connection pool.
@@ -47,57 +60,19 @@ func (r *Repository) Close() { r.pool.Close() }
 // Ping verifies that PostgreSQL is reachable.
 func (r *Repository) Ping(ctx context.Context) error { return r.pool.Ping(ctx) }
 
-// Migrate applies embedded migrations under a transaction-scoped advisory lock.
-// Both server and worker may call it concurrently at startup.
+// Migrate applies embedded goose migrations with session advisory locking.
 func (r *Repository) Migrate(ctx context.Context) error {
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin migration: %w", err)
+	if r.migrate == nil {
+		return errors.New("PostgreSQL migrator is not configured")
 	}
-	defer rollback(ctx, tx)
-	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", int64(4815162342)); err != nil {
-		return fmt.Errorf("lock migrations: %w", err)
+	if err := r.migrate(ctx); err != nil {
+		return fmt.Errorf("migrate PostgreSQL: %w", err)
 	}
-	if _, err := tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
-        version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    )`); err != nil {
-		return fmt.Errorf("create migration registry: %w", err)
-	}
-	entries, err := migrations.Files.ReadDir(".")
-	if err != nil {
-		return fmt.Errorf("list migrations: %w", err)
-	}
-	names := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".sql") {
-			names = append(names, entry.Name())
-		}
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		var applied bool
-		if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = $1)", name).Scan(&applied); err != nil {
-			return fmt.Errorf("read migration %s: %w", name, err)
-		}
-		if applied {
-			continue
-		}
-		source, err := migrations.Files.ReadFile(name)
-		if err != nil {
-			return fmt.Errorf("read migration %s: %w", name, err)
-		}
-		if _, err := tx.Exec(ctx, string(source)); err != nil {
-			return fmt.Errorf("apply migration %s: %w", name, err)
-		}
-		if _, err := tx.Exec(ctx, "INSERT INTO schema_migrations (version) VALUES ($1)", name); err != nil {
-			return fmt.Errorf("record migration %s: %w", name, err)
-		}
-	}
-	return commit(ctx, tx, "migrations")
+	return nil
 }
 
-const avatarColumns = `id::text, user_id, file_name, mime_type, size_bytes, s3_key,
-    width, height, thumbnails, processing_status, created_at, updated_at, deleted_at`
+const avatarColumns = `id::text, user_id::text, file_name::text, mime_type::text, size_bytes, s3_key::text,
+    width, height, thumbnails, processing_status::text, created_at, updated_at, deleted_at`
 
 type storedThumbnail struct {
 	Size  string `json:"size"`

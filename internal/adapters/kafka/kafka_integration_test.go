@@ -66,7 +66,7 @@ type consumerRun struct {
 
 func startKafkaConsumer(t *testing.T, fixture kafkaFixture, handler func(context.Context, domain.Event) error) *consumerRun {
 	t.Helper()
-	consumer, err := NewConsumer(fixture.cluster.ListenAddrs(), fixture.topic, fixture.group)
+	consumer, err := NewConsumer(fixture.cluster.ListenAddrs(), fixture.topic, fixture.group, testLogger())
 	if err != nil {
 		t.Fatal(err)
 	}

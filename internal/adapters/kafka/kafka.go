@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"strconv"
 	"time"
@@ -98,14 +99,18 @@ type consumerClient interface {
 }
 
 type Consumer struct {
+	logger     *slog.Logger
 	client     consumerClient
 	topic      string
 	retryDelay time.Duration
 }
 
-func NewConsumer(brokers []string, topic, group string) (*Consumer, error) {
+func NewConsumer(brokers []string, topic, group string, logger *slog.Logger) (*Consumer, error) {
 	if len(brokers) == 0 || topic == "" || group == "" {
 		return nil, fmt.Errorf("kafka brokers, topic and group must not be empty")
+	}
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(brokers...),
@@ -119,7 +124,7 @@ func NewConsumer(brokers []string, topic, group string) (*Consumer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create Kafka consumer: %w", err)
 	}
-	return &Consumer{client: client, topic: topic, retryDelay: time.Second}, nil
+	return &Consumer{client: client, topic: topic, retryDelay: time.Second, logger: logger}, nil
 }
 
 func (c *Consumer) Close() { c.client.CloseAllowingRebalance() }
@@ -148,7 +153,7 @@ func (c *Consumer) Run(ctx context.Context, handler func(context.Context, domain
 		c.client.AllowRebalance()
 		if errs := fetches.Errors(); len(errs) != 0 {
 			for _, err := range errs {
-				slog.Error("Kafka fetch failed", "topic", err.Topic, "partition", err.Partition, "error", err.Err)
+				c.logger.ErrorContext(ctx, "Kafka fetch failed", "topic", err.Topic, "partition", err.Partition, "error", err.Err)
 			}
 			if err := wait(ctx, c.retryDelay); err != nil {
 				return err
@@ -175,7 +180,7 @@ func (c *Consumer) handleRecord(ctx context.Context, record *kgo.Record, handler
 		if errors.Is(err, domain.ErrInvalid) || errors.Is(err, domain.ErrNotFound) || errors.Is(err, domain.ErrUnsupported) || errors.Is(err, domain.ErrTooLarge) {
 			return c.deadLetterAndCommit(ctx, record, err)
 		}
-		slog.Error("Kafka handler failed; retrying", "message_id", event.ID, "error", err, "retry_in", delay)
+		c.logger.ErrorContext(ctx, "Kafka handler failed; retrying", "message_id", event.ID, "error", err, "retry_in", delay)
 		if err := wait(ctx, delay); err != nil {
 			return err
 		}
@@ -203,7 +208,7 @@ func (c *Consumer) deadLetterAndCommit(ctx context.Context, record *kgo.Record, 
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			slog.Error("Kafka dead-letter publish failed; retrying", "error", err, "retry_in", delay)
+			c.logger.ErrorContext(ctx, "Kafka dead-letter publish failed; retrying", "error", err, "retry_in", delay)
 		}
 		if err := wait(ctx, delay); err != nil {
 			return err

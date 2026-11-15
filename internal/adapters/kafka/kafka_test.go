@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -141,7 +143,7 @@ func TestEnsureTopicsAcceptsExistingAndRejectsErrors(t *testing.T) {
 
 func TestHandlerRetriesSameRecordBeforeCommit(t *testing.T) {
 	client := &fakeClient{}
-	consumer := &Consumer{client: client, topic: "avatars", retryDelay: time.Nanosecond}
+	consumer := &Consumer{logger: testLogger(), client: client, topic: "avatars", retryDelay: time.Nanosecond}
 	attempts := 0
 	err := consumer.handleRecord(context.Background(), validRecord(t), func(context.Context, domain.Event) error {
 		attempts++
@@ -160,7 +162,7 @@ func TestHandlerRetriesSameRecordBeforeCommit(t *testing.T) {
 
 func TestMalformedRecordIsDurablyDeadLetteredBeforeCommit(t *testing.T) {
 	client := &fakeClient{produceErrs: []error{errors.New("unavailable"), nil}}
-	consumer := &Consumer{client: client, topic: "avatars", retryDelay: time.Nanosecond}
+	consumer := &Consumer{logger: testLogger(), client: client, topic: "avatars", retryDelay: time.Nanosecond}
 	record := validRecord(t)
 	record.Value = []byte("malformed JSON")
 	err := consumer.handleRecord(context.Background(), record, func(context.Context, domain.Event) error { t.Fatal("invalid JSON must not reach handler"); return nil })
@@ -181,7 +183,7 @@ func TestMalformedRecordIsDurablyDeadLetteredBeforeCommit(t *testing.T) {
 
 func TestPermanentHandlerErrorGoesToDeadLetter(t *testing.T) {
 	client := &fakeClient{}
-	consumer := &Consumer{client: client, topic: "avatars", retryDelay: time.Nanosecond}
+	consumer := &Consumer{logger: testLogger(), client: client, topic: "avatars", retryDelay: time.Nanosecond}
 	if err := consumer.handleRecord(context.Background(), validRecord(t), func(context.Context, domain.Event) error { return fmt.Errorf("bad image: %w", domain.ErrInvalid) }); err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +197,7 @@ func TestCanceledRetryDoesNotAcknowledge(t *testing.T) {
 		t.Run(fmt.Sprint(poison), func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			client := &fakeClient{produceErrs: []error{context.Canceled}}
-			consumer := &Consumer{client: client, topic: "avatars", retryDelay: time.Second}
+			consumer := &Consumer{logger: testLogger(), client: client, topic: "avatars", retryDelay: time.Second}
 			record := validRecord(t)
 			if poison {
 				record.Value = []byte("invalid")
@@ -213,7 +215,7 @@ func TestRunStopsOnCommitFailureWithoutPollingNext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	client := &fakeClient{records: []*kgo.Record{validRecord(t)}, commitErr: errors.New("commit unavailable"), cancel: cancel}
-	consumer := &Consumer{client: client, topic: "avatars", retryDelay: time.Nanosecond}
+	consumer := &Consumer{logger: testLogger(), client: client, topic: "avatars", retryDelay: time.Nanosecond}
 	if err := consumer.Run(ctx, func(context.Context, domain.Event) error { return nil }); err == nil {
 		t.Fatal("expected commit error")
 	}
@@ -226,7 +228,7 @@ func TestRunReturnsOnCancellationAfterSuccess(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	client := &fakeClient{records: []*kgo.Record{validRecord(t)}, cancel: cancel}
-	consumer := &Consumer{client: client, topic: "avatars", retryDelay: time.Nanosecond}
+	consumer := &Consumer{logger: testLogger(), client: client, topic: "avatars", retryDelay: time.Nanosecond}
 	if err := consumer.Run(ctx, func(context.Context, domain.Event) error { return nil }); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
@@ -249,7 +251,7 @@ func TestRunDoesNotDiscardRecordsWhenAnotherPartitionHasFetchError(t *testing.T)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	client := &fakeClient{records: []*kgo.Record{validRecord(t)}, cancel: cancel, fetchError: errors.New("partition temporarily unavailable")}
-	consumer := &Consumer{client: client, topic: "avatars", retryDelay: time.Nanosecond}
+	consumer := &Consumer{logger: testLogger(), client: client, topic: "avatars", retryDelay: time.Nanosecond}
 	attempts := 0
 	if err := consumer.Run(ctx, func(context.Context, domain.Event) error { attempts++; return nil }); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
@@ -261,7 +263,7 @@ func TestRunDoesNotDiscardRecordsWhenAnotherPartitionHasFetchError(t *testing.T)
 
 func TestOversizedOriginalIsDeadLetteredWithoutBlockingPartition(t *testing.T) {
 	client := &fakeClient{}
-	consumer := &Consumer{client: client, topic: "avatars", retryDelay: time.Nanosecond}
+	consumer := &Consumer{logger: testLogger(), client: client, topic: "avatars", retryDelay: time.Nanosecond}
 	attempts := 0
 	err := consumer.handleRecord(context.Background(), validRecord(t), func(context.Context, domain.Event) error {
 		attempts++
@@ -272,5 +274,102 @@ func TestOversizedOriginalIsDeadLetteredWithoutBlockingPartition(t *testing.T) {
 	}
 	if attempts != 1 || fmt.Sprint(client.actions) != "[produce commit]" {
 		t.Fatalf("attempts=%d actions=%v", attempts, client.actions)
+	}
+}
+
+func testLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func TestNewConsumerUsesInjectedLoggerAndHandlesNil(t *testing.T) {
+	logger := testLogger()
+	for _, candidate := range []*slog.Logger{logger, nil} {
+		consumer, err := NewConsumer([]string{"localhost:9092"}, "avatars", "workers", candidate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		consumer.Close()
+		if consumer.logger == nil {
+			t.Fatal("consumer must always have a usable logger")
+		}
+		if candidate != nil && consumer.logger != candidate {
+			t.Fatal("constructor discarded the injected logger")
+		}
+	}
+}
+
+func TestConsumerReportsFailuresToInjectedLogger(t *testing.T) {
+	cases := []struct {
+		name       string
+		message    string
+		run        func(*testing.T, *Consumer, *fakeClient) error
+		attributes map[string]any
+	}{
+		{
+			name: "handler retry", message: "Kafka handler failed; retrying",
+			run: func(t *testing.T, consumer *Consumer, _ *fakeClient) error {
+				attempts := 0
+				return consumer.handleRecord(context.Background(), validRecord(t), func(context.Context, domain.Event) error {
+					attempts++
+					if attempts == 1 {
+						return errors.New("temporary storage failure")
+					}
+					return nil
+				})
+			},
+			attributes: map[string]any{"message_id": validEvent().ID, "error": "temporary storage failure"},
+		},
+		{
+			name: "dead-letter retry", message: "Kafka dead-letter publish failed; retrying",
+			run: func(t *testing.T, consumer *Consumer, client *fakeClient) error {
+				client.produceErrs = []error{errors.New("temporary broker failure"), nil}
+				record := validRecord(t)
+				record.Value = []byte("invalid JSON")
+				return consumer.handleRecord(context.Background(), record, func(context.Context, domain.Event) error { t.Fatal("invalid JSON reached handler"); return nil })
+			},
+			attributes: map[string]any{"error": "temporary broker failure"},
+		},
+		{
+			name: "fetch retry", message: "Kafka fetch failed",
+			run: func(t *testing.T, consumer *Consumer, client *fakeClient) error {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				client.fetchError = errors.New("temporary fetch failure")
+				client.cancel = cancel
+				err := consumer.Run(ctx, func(context.Context, domain.Event) error { t.Fatal("failed fetch reached handler"); return nil })
+				if !errors.Is(err, context.Canceled) {
+					return err
+				}
+				return nil
+			},
+			attributes: map[string]any{"topic": "avatars", "partition": float64(2), "error": "temporary fetch failure"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var output bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&output, nil)).With("scope", "injected-consumer")
+			client := &fakeClient{}
+			consumer := &Consumer{client: client, topic: "avatars", retryDelay: time.Nanosecond, logger: logger}
+			if err := tc.run(t, consumer, client); err != nil {
+				t.Fatal(err)
+			}
+			decoder := json.NewDecoder(&output)
+			var record map[string]any
+			if err := decoder.Decode(&record); err != nil {
+				t.Fatalf("injected logger did not receive a failure: %v", err)
+			}
+			if record["msg"] != tc.message || record["level"] != "ERROR" || record["scope"] != "injected-consumer" {
+				t.Fatalf("unexpected log record: %v", record)
+			}
+			for key, want := range tc.attributes {
+				if record[key] != want {
+					t.Fatalf("log attribute %s: got %v, want %v", key, record[key], want)
+				}
+			}
+			if err := decoder.Decode(&record); !errors.Is(err, io.EOF) {
+				t.Fatalf("unexpected extra log record: %v, error=%v", record, err)
+			}
+		})
 	}
 }
