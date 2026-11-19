@@ -30,9 +30,10 @@ type Dimensions struct {
 	Height int `json:"height"`
 }
 type Thumbnail struct {
-	Size  string `json:"size"`
-	URL   string `json:"url"`
-	S3Key string `json:"-"`
+	Size      string `json:"size"`
+	URL       string `json:"url"`
+	S3Key     string `json:"-"`
+	SizeBytes int64  `json:"-"`
 }
 type Avatar struct {
 	ID         string      `json:"id"`
@@ -51,13 +52,14 @@ type Avatar struct {
 }
 
 type Event struct {
-	ID        string    `json:"message_id"`
-	Type      string    `json:"type"`
-	AvatarID  string    `json:"avatar_id"`
-	UserID    string    `json:"user_id"`
-	S3Key     string    `json:"s3_key,omitempty"`
-	S3Keys    []string  `json:"s3_keys,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
+	ID           string            `json:"message_id"`
+	Type         string            `json:"type"`
+	AvatarID     string            `json:"avatar_id"`
+	UserID       string            `json:"user_id"`
+	S3Key        string            `json:"s3_key,omitempty"`
+	S3Keys       []string          `json:"s3_keys,omitempty"`
+	CreatedAt    time.Time         `json:"created_at"`
+	TraceContext map[string]string `json:"trace_context,omitempty"`
 }
 
 type JobResult struct {

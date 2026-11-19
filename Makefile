@@ -1,4 +1,4 @@
-.PHONY: test coverage lint build demo up down smoke check comments
+.PHONY: test coverage lint build demo up down smoke check comments observability-check observability-smoke
 
 test:
 	go test -race ./...
@@ -30,5 +30,17 @@ down:
 
 smoke:
 	python3 scripts/smoke.py
+
+observability-check:
+	docker compose config --quiet
+	docker compose run --rm --no-deps --entrypoint /bin/promtool prometheus check config /etc/prometheus/prometheus.yml
+	docker compose run --rm --no-deps --entrypoint /bin/promtool prometheus test rules /etc/prometheus/alerts.test.yml
+	docker compose run --rm --no-deps --entrypoint /bin/amtool alertmanager check-config /etc/alertmanager/alertmanager.yml
+	docker compose run --rm --no-deps loki -config.file=/etc/loki/config.yaml -verify-config=true
+	docker compose run --rm --no-deps alloy validate /etc/alloy/config.alloy
+	docker compose run --rm --no-deps jaeger validate --config=/etc/jaeger/config.yaml
+
+observability-smoke:
+	python3 scripts/observability_smoke.py
 
 check: test coverage lint build

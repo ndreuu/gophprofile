@@ -14,6 +14,12 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
+
 	"gophprofile/internal/domain"
 )
 
@@ -45,7 +51,12 @@ func NewPublisher(brokers []string, topic string) (*Publisher, error) {
 	return &Publisher{client: client, topic: topic}, nil
 }
 
-func (p *Publisher) Publish(ctx context.Context, event domain.Event) error {
+func (p *Publisher) Publish(ctx context.Context, event domain.Event) (err error) {
+	if !trace.SpanContextFromContext(ctx).IsValid() {
+		ctx = propagation.TraceContext{}.Extract(ctx, propagation.MapCarrier(event.TraceContext))
+	}
+	ctx, span := startMessagingSpan(ctx, p.topic, "publish", trace.SpanKindProducer)
+	defer func() { finishMessagingSpan(span, err) }()
 	if err := domain.ValidateEvent(event); err != nil {
 		return fmt.Errorf("publish event: %w", err)
 	}
@@ -55,6 +66,7 @@ func (p *Publisher) Publish(ctx context.Context, event domain.Event) error {
 	}
 
 	record := &kgo.Record{Topic: p.topic, Key: []byte(event.AvatarID), Value: data}
+	propagation.TraceContext{}.Inject(ctx, recordCarrier{record})
 	if err := p.client.ProduceSync(ctx, record).FirstErr(); err != nil {
 		return fmt.Errorf("publish Kafka event: %w", err)
 	}
@@ -162,9 +174,19 @@ func (c *Consumer) Run(ctx context.Context, handler func(context.Context, domain
 	}
 }
 
-func (c *Consumer) handleRecord(ctx context.Context, record *kgo.Record, handler func(context.Context, domain.Event) error) error {
-	event, err := decodeEvent(record.Value)
+func (c *Consumer) handleRecord(ctx context.Context, record *kgo.Record, handler func(context.Context, domain.Event) error) (err error) {
+	ctx = trace.ContextWithSpanContext(ctx, trace.SpanContext{})
+	ctx = propagation.TraceContext{}.Extract(ctx, recordCarrier{record})
+	event, decodeErr := decodeEvent(record.Value)
+	if !trace.SpanContextFromContext(ctx).IsValid() && decodeErr == nil {
+		ctx = propagation.TraceContext{}.Extract(ctx, propagation.MapCarrier(event.TraceContext))
+	}
+	ctx, span := startMessagingSpan(ctx, record.Topic, "process", trace.SpanKindConsumer)
+	defer func() { finishMessagingSpan(span, err) }()
+	span.SetAttributes(attribute.String("messaging.destination.partition.id", strconv.Itoa(int(record.Partition))), attribute.Int64("messaging.kafka.offset", record.Offset))
+	err = decodeErr
 	if err != nil {
+		recordMessagingError(span, "Kafka event rejected")
 		return c.deadLetterAndCommit(ctx, record, err)
 	}
 	delay := c.retryDelay
@@ -178,8 +200,10 @@ func (c *Consumer) handleRecord(ctx context.Context, record *kgo.Record, handler
 		}
 
 		if errors.Is(err, domain.ErrInvalid) || errors.Is(err, domain.ErrNotFound) || errors.Is(err, domain.ErrUnsupported) || errors.Is(err, domain.ErrTooLarge) {
+			recordMessagingError(span, "Kafka event rejected")
 			return c.deadLetterAndCommit(ctx, record, err)
 		}
+		span.AddEvent("handler retry")
 		c.logger.ErrorContext(ctx, "Kafka handler failed; retrying", "message_id", event.ID, "error", err, "retry_in", delay)
 		if err := wait(ctx, delay); err != nil {
 			return err
@@ -189,7 +213,9 @@ func (c *Consumer) handleRecord(ctx context.Context, record *kgo.Record, handler
 	return c.commit(ctx, record)
 }
 
-func (c *Consumer) deadLetterAndCommit(ctx context.Context, record *kgo.Record, reason error) error {
+func (c *Consumer) deadLetterAndCommit(ctx context.Context, record *kgo.Record, reason error) (err error) {
+	ctx, span := startMessagingSpan(ctx, c.topic+".dlq", "publish", trace.SpanKindProducer)
+	defer func() { finishMessagingSpan(span, err) }()
 
 	dead := &kgo.Record{
 		Topic: c.topic + ".dlq", Key: record.Key, Value: record.Value,
@@ -200,6 +226,7 @@ func (c *Consumer) deadLetterAndCommit(ctx context.Context, record *kgo.Record, 
 			{Key: "source_offset", Value: []byte(strconv.FormatInt(record.Offset, 10))},
 		},
 	}
+	propagation.TraceContext{}.Inject(ctx, recordCarrier{dead})
 	delay := c.retryDelay
 	for {
 		if err := c.client.ProduceSync(ctx, dead).FirstErr(); err == nil {
@@ -256,3 +283,54 @@ func wait(ctx context.Context, delay time.Duration) error {
 }
 
 var _ domain.Publisher = (*Publisher)(nil)
+
+type recordCarrier struct{ record *kgo.Record }
+
+func (c recordCarrier) Get(key string) string {
+	for _, header := range c.record.Headers {
+		if header.Key == key {
+			return string(header.Value)
+		}
+	}
+	return ""
+}
+
+func (c recordCarrier) Set(key, value string) {
+	for index := range c.record.Headers {
+		if c.record.Headers[index].Key == key {
+			c.record.Headers[index].Value = []byte(value)
+			return
+		}
+	}
+	c.record.Headers = append(c.record.Headers, kgo.RecordHeader{Key: key, Value: []byte(value)})
+}
+
+func (c recordCarrier) Keys() []string {
+	keys := make([]string, 0, len(c.record.Headers))
+	for _, header := range c.record.Headers {
+		keys = append(keys, header.Key)
+	}
+	return keys
+}
+
+func startMessagingSpan(ctx context.Context, topic, operation string, kind trace.SpanKind) (context.Context, trace.Span) {
+	operationType := "process"
+	if kind == trace.SpanKindProducer {
+		operationType = "send"
+	}
+	return otel.Tracer("gophprofile/kafka").Start(ctx, "kafka "+operation+" "+topic,
+		trace.WithSpanKind(kind),
+		trace.WithAttributes(attribute.String("messaging.system", "kafka"), attribute.String("messaging.destination.name", topic), attribute.String("messaging.operation.name", operation), attribute.String("messaging.operation.type", operationType)))
+}
+
+func recordMessagingError(span trace.Span, message string) {
+	span.RecordError(errors.New(message))
+	span.SetStatus(codes.Error, message)
+}
+
+func finishMessagingSpan(span trace.Span, err error) {
+	if err != nil {
+		recordMessagingError(span, "Kafka operation failed")
+	}
+	span.End()
+}

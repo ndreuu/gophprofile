@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -30,6 +31,12 @@ type Config struct {
 	AllowedOrigins       []string
 	RateLimitRequests    int
 	RateLimitWindow      time.Duration
+	MetricsAddr          string
+	OTELServiceName      string
+	OTLPEndpoint         string
+	TraceSampleRatio     float64
+	Environment          string
+	LogLevel             string
 }
 
 func Load() (Config, error) {
@@ -45,6 +52,12 @@ func Load() (Config, error) {
 		S3Bucket:            env("S3_BUCKET", "avatars"),
 		WorkerRetryAttempts: 3,
 		RateLimitRequests:   120,
+		MetricsAddr:         env("METRICS_ADDR", ":9091"),
+		OTELServiceName:     os.Getenv("OTEL_SERVICE_NAME"),
+		OTLPEndpoint:        os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
+		TraceSampleRatio:    1,
+		Environment:         env("DEPLOYMENT_ENVIRONMENT", "local"),
+		LogLevel:            env("LOG_LEVEL", "info"),
 	}
 	for _, broker := range strings.Split(env("KAFKA_BROKERS", "localhost:19092"), ",") {
 		broker = strings.TrimSpace(broker)
@@ -61,6 +74,27 @@ func Load() (Config, error) {
 	}
 	if err := validAddress(cfg.HTTPAddr); err != nil {
 		return Config{}, fmt.Errorf("HTTP_ADDR: %w", err)
+	}
+	if err := validAddress(cfg.MetricsAddr); err != nil {
+		return Config{}, fmt.Errorf("METRICS_ADDR: %w", err)
+	}
+	if cfg.OTLPEndpoint != "" {
+		endpoint, err := url.Parse(cfg.OTLPEndpoint)
+		if err != nil || endpoint.Hostname() == "" || (endpoint.Scheme != "http" && endpoint.Scheme != "https") || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" {
+			return Config{}, fmt.Errorf("OTEL_EXPORTER_OTLP_ENDPOINT must be an http(s) URL without credentials, query or fragment")
+		}
+	}
+	if raw, ok := os.LookupEnv("OTEL_TRACES_SAMPLER_ARG"); ok {
+		ratio, err := strconv.ParseFloat(raw, 64)
+		if err != nil || math.IsNaN(ratio) || math.IsInf(ratio, 0) || ratio < 0 || ratio > 1 {
+			return Config{}, fmt.Errorf("OTEL_TRACES_SAMPLER_ARG must be a number between 0 and 1")
+		}
+		cfg.TraceSampleRatio = ratio
+	}
+	switch strings.ToLower(cfg.LogLevel) {
+	case "debug", "info", "warn", "error":
+	default:
+		return Config{}, fmt.Errorf("LOG_LEVEL must be debug, info, warn or error")
 	}
 	if cfg.AppMode == "production" {
 		for _, item := range []struct{ name, value string }{

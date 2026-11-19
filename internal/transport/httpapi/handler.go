@@ -49,11 +49,17 @@ func New(service AvatarService, checks map[string]func(context.Context) error, l
 		limiter: newWindowLimiter(settings.RateLimitRequests, settings.RateLimitWindow)}
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
+	if settings.Middleware != nil {
+		r.Use(settings.Middleware)
+	}
 	r.Use(h.security)
 	r.Use(h.recover)
 	r.Use(h.cors)
 	r.Use(h.rateLimit)
 	r.Get("/health", h.health)
+	if settings.MetricsHandler != nil {
+		r.Handle("/metrics", settings.MetricsHandler)
+	}
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Post("/avatars", h.upload)
 		r.Get("/avatars/{avatarID}", h.content)

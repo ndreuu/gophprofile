@@ -9,6 +9,8 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 	"gophprofile/internal/domain"
 )
 
@@ -44,6 +46,8 @@ func (r *Repository) Create(ctx context.Context, a domain.Avatar, e domain.Event
 		return fmt.Errorf("avatar already exists")
 	}
 	r.avatars[a.ID] = clone(a)
+	e.TraceContext = map[string]string{}
+	otel.GetTextMapPropagator().Inject(ctx, propagation.MapCarrier(e.TraceContext))
 	r.outbox = append(r.outbox, entry{event: e})
 	return nil
 }
@@ -113,6 +117,8 @@ func (r *Repository) SoftDelete(ctx context.Context, id, user string, e domain.E
 	for _, t := range a.Thumbnails {
 		e.S3Keys = append(e.S3Keys, t.S3Key)
 	}
+	e.TraceContext = map[string]string{}
+	otel.GetTextMapPropagator().Inject(ctx, propagation.MapCarrier(e.TraceContext))
 	r.outbox = append(r.outbox, entry{event: e})
 	return nil
 }
@@ -167,6 +173,7 @@ func (r *Repository) DispatchPending(ctx context.Context, publish func(context.C
 	if idx < 0 {
 		return false, nil
 	}
+	ctx = otel.GetTextMapPropagator().Extract(ctx, propagation.MapCarrier(e.TraceContext))
 	if err := publish(ctx, e); err != nil {
 		return false, err
 	}
@@ -176,6 +183,28 @@ func (r *Repository) DispatchPending(ctx context.Context, publish func(context.C
 	return true, nil
 }
 func (r *Repository) Ping(ctx context.Context) error { return ctx.Err() }
+
+func (r *Repository) ObservabilityStats(ctx context.Context) (storage, queue int64, acquired, idle, total int32, err error) {
+	if err = ctx.Err(); err != nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, avatar := range r.avatars {
+		if avatar.DeletedAt == nil {
+			storage += avatar.Size
+			for _, thumbnail := range avatar.Thumbnails {
+				storage += thumbnail.SizeBytes
+			}
+		}
+	}
+	for _, item := range r.outbox {
+		if !item.sent {
+			queue++
+		}
+	}
+	return
+}
 
 type Storage struct {
 	mu      sync.RWMutex
@@ -240,8 +269,9 @@ func (b *Bus) Run(ctx context.Context, handler func(context.Context, domain.Even
 		case <-ctx.Done():
 			return ctx.Err()
 		case e := <-b.queue:
+			eventCtx := otel.GetTextMapPropagator().Extract(ctx, propagation.MapCarrier(e.TraceContext))
 			for {
-				if err := handler(ctx, e); err == nil {
+				if err := handler(eventCtx, e); err == nil {
 					break
 				}
 				timer := time.NewTimer(time.Second)

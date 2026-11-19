@@ -2,56 +2,36 @@
 
 ## Docker Compose
 
-Требуется Docker с Compose. Порты 8080, 5432, 9000, 9001 и 19092 должны быть свободны.
+Требуется Docker с Compose и не менее 4 ГБ RAM для Docker.
 
 ```sh
-git clone --branch sprint-11/gophprofile git@github.com:ndreuu/gophprofile.git
+git clone --branch sprint12 git@github.com:ndreuu/gophprofile.git
 cd gophprofile
 cp .env.example .env
 docker compose up --build -d --wait --wait-timeout 300
 ```
 
-Первая сборка может занять несколько минут.
+Если проект уже скачан, выполняйте команды из его корня. Существующий `.env` сохраните и добавьте недостающие параметры из `.env.example`.
+
+После запуска:
 
 - Приложение: http://localhost:8080
-- Проверка работоспособности: http://localhost:8080/health
-- Консоль MinIO: http://localhost:9001 — логин и пароль заданы в `.env`.
+- Grafana: http://localhost:3000/d/gophprofile-overview — логин и пароль из `GRAFANA_ADMIN_USER` и `GRAFANA_ADMIN_PASSWORD` в `.env`.
+- Prometheus: http://localhost:9090
+- Jaeger: http://localhost:16686
+- MinIO: http://localhost:9001 — логин и пароль из `MINIO_ROOT_USER` и `MINIO_ROOT_PASSWORD` в `.env`.
 
-Просмотр логов:
+Логи приложения:
 
 ```sh
 docker compose logs -f server worker
 ```
 
-Остановка с сохранением данных:
+Остановка:
 
 ```sh
 docker compose down
 ```
-
-## Локальный запуск Go-приложений
-
-Требуются Go 1.26+ и Docker с Compose. Команды выполняются из корня проекта.
-
-```sh
-cp .env.example .env
-docker compose up -d postgres kafka minio
-set -a
-. ./.env
-set +a
-go run ./cmd/server
-```
-
-Во втором терминале из корня проекта:
-
-```sh
-set -a
-. ./.env
-set +a
-go run ./cmd/worker
-```
-
-Откройте http://localhost:8080. Для остановки server и worker нажмите `Ctrl+C` в каждом терминале, затем выполните `docker compose down`.
 
 ## Демо без Docker
 
@@ -61,4 +41,4 @@ go run ./cmd/worker
 APP_MODE=demo go run ./cmd/server
 ```
 
-Откройте http://localhost:8080. Для остановки нажмите `Ctrl+C`. Данные демо хранятся в памяти и сбрасываются после остановки.
+Откройте http://localhost:8080. Остановка — `Ctrl+C`. Данные демо хранятся в памяти.

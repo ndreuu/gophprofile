@@ -14,8 +14,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"gophprofile/internal/app"
 	"gophprofile/internal/config"
+	"gophprofile/internal/observability"
 	"gophprofile/internal/transport/httpapi"
 	"gophprofile/internal/worker"
 )
@@ -31,7 +33,7 @@ func main() {
 		}
 		return
 	}
-	if err := run(logger); err != nil {
+	if err := run(); err != nil {
 		logger.Error("server stopped", "error", err)
 		os.Exit(1)
 	}
@@ -55,13 +57,30 @@ func healthcheck() error {
 	}
 	return nil
 }
-func run(logger *slog.Logger) error {
+func run() error {
 	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	serviceName := cfg.OTELServiceName
+	if serviceName == "" {
+		serviceName = "gophprofile-server"
+	}
+	telemetry, err := observability.New(ctx, observability.Options{ServiceName: serviceName, Environment: cfg.Environment, OTLPEndpoint: cfg.OTLPEndpoint, SampleRatio: cfg.TraceSampleRatio, LogLevel: cfg.LogLevel})
+	if err != nil {
+		return err
+	}
+	logger := telemetry.Logger
+	slog.SetDefault(logger)
+	defer func() {
+		flush, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+		defer cancel()
+		if err := telemetry.Shutdown(flush); err != nil {
+			logger.Error("flush telemetry", "error", err)
+		}
+	}()
 	startup, cancel := context.WithTimeout(ctx, 90*time.Second)
 	resources, err := app.Open(startup, cfg, cfg.AppMode == "demo", logger)
 	cancel()
@@ -69,7 +88,10 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	defer resources.Close()
+	resources.Service.WithMetrics(telemetry.Metrics)
+	resources.Worker.WithMetrics(telemetry.Metrics)
 	var jobs sync.WaitGroup
+	jobs.Go(func() { resources.ObserveMetrics(ctx, telemetry.Metrics, logger) })
 	if cfg.AppMode == "demo" {
 		logger.Warn("demo mode: data is ephemeral; production uses PostgreSQL, MinIO and Kafka")
 		jobs.Go(func() { worker.Dispatch(ctx, resources.Outbox, resources.Publisher, cfg.OutboxPollInterval, logger) })
@@ -80,7 +102,7 @@ func run(logger *slog.Logger) error {
 			}
 		})
 	}
-	handler := httpapi.New(resources.Service, resources.Checks(), logger, httpapi.Options{AllowedOrigins: cfg.AllowedOrigins, RateLimitRequests: cfg.RateLimitRequests, RateLimitWindow: cfg.RateLimitWindow})
+	handler := httpapi.New(resources.Service, resources.Checks(), logger, httpapi.Options{AllowedOrigins: cfg.AllowedOrigins, RateLimitRequests: cfg.RateLimitRequests, RateLimitWindow: cfg.RateLimitWindow, Middleware: telemetry.Middleware, MetricsHandler: promhttp.HandlerFor(telemetry.Registry, promhttp.HandlerOpts{})})
 	server := &http.Server{Addr: cfg.HTTPAddr, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 60 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 16 << 10,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("X-App-Mode", cfg.AppMode)

@@ -4,6 +4,13 @@ x-app: &app
   image: gophprofile:local
   build: .
   restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+  labels:
+    gophprofile.logs: "true"
   environment: &app-env
     APP_MODE: production
     HTTP_ADDR: :8080
@@ -19,6 +26,9 @@ x-app: &app
     CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
     RATE_LIMIT_REQUESTS: ${RATE_LIMIT_REQUESTS:-120}
     RATE_LIMIT_WINDOW: ${RATE_LIMIT_WINDOW:-1m}
+    LOG_LEVEL: ${LOG_LEVEL:-info}
+    OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+    OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACES_SAMPLER_ARG:-1}
   depends_on:
     postgres:
       condition: service_healthy
@@ -30,6 +40,9 @@ x-app: &app
 services:
   server:
     <<: *app
+    environment:
+      <<: *app-env
+      OTEL_SERVICE_NAME: gophprofile-server
     ports:
       - "127.0.0.1:${HTTP_PORT:-8080}:8080"
     healthcheck:
@@ -42,6 +55,109 @@ services:
   worker:
     <<: *app
     entrypoint: [/app/worker]
+    environment:
+      <<: *app-env
+      OTEL_SERVICE_NAME: gophprofile-worker
+      METRICS_ADDR: :9091
+    ports:
+      - "127.0.0.1:${WORKER_METRICS_PORT:-9091}:9091"
+
+  prometheus:
+    image: prom/prometheus:v3.16.0
+    restart: unless-stopped
+    mem_limit: 384m
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=1d
+      - --storage.tsdb.retention.size=512MB
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./observability/prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      - server
+      - worker
+      - alertmanager
+
+  alertmanager:
+    image: prom/alertmanager:v0.35.0
+    restart: unless-stopped
+    mem_limit: 96m
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --cluster.listen-address=
+    ports:
+      - "127.0.0.1:${ALERTMANAGER_PORT:-9093}:9093"
+    volumes:
+      - ./observability/alertmanager:/etc/alertmanager:ro
+      - alertmanager-data:/alertmanager
+
+  grafana:
+    image: grafana/grafana:13.3.1
+    restart: unless-stopped
+    mem_limit: 768m
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_PLUGINS_PREINSTALL_AUTO_UPDATE: "false"
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - loki
+      - jaeger
+
+  jaeger:
+    image: cr.jaegertracing.io/jaegertracing/jaeger:2.20.0
+    restart: unless-stopped
+    mem_limit: 256m
+    environment:
+      OTEL_TRACES_SAMPLER: always_off
+    command: [--config=/etc/jaeger/config.yaml]
+    ports:
+      - "127.0.0.1:${JAEGER_PORT:-16686}:16686"
+      - "127.0.0.1:4318:4318"
+    volumes:
+      - ./observability/jaeger/config.yaml:/etc/jaeger/config.yaml:ro
+
+  loki:
+    image: grafana/loki:3.6.21
+    restart: unless-stopped
+    mem_limit: 384m
+    command: [-config.file=/etc/loki/config.yaml]
+    ports:
+      - "127.0.0.1:${LOKI_PORT:-3100}:3100"
+    volumes:
+      - ./observability/loki/config.yaml:/etc/loki/config.yaml:ro
+      - ./observability/loki/rules:/etc/loki/rules:ro
+      - loki-data:/loki
+    depends_on:
+      - alertmanager
+
+  alloy:
+    image: grafana/alloy:v1.21.3
+    restart: unless-stopped
+    mem_limit: 192m
+    command:
+      - run
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    volumes:
+      - ./observability/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy-data:/var/lib/alloy/data
+    depends_on:
+      - loki
 
   postgres:
     image: postgres:17.6-alpine
@@ -108,3 +224,8 @@ volumes:
   postgres-data:
   minio-data:
   kafka-data:
+  prometheus-data:
+  alertmanager-data:
+  grafana-data:
+  loki-data:
+  alloy-data:

@@ -15,6 +15,7 @@ func clearEnvironment(t *testing.T) {
 		"S3_ENDPOINT", "S3_ACCESS_KEY", "S3_SECRET_KEY", "S3_BUCKET", "S3_USE_SSL", "SHUTDOWN_TIMEOUT",
 		"OUTBOX_POLL_INTERVAL", "WORKER_RETRY_ATTEMPTS", "WORKER_RETRY_BASE_DELAY", "WORKER_RETRY_MAX_DELAY",
 		"CORS_ALLOWED_ORIGINS", "RATE_LIMIT_REQUESTS", "RATE_LIMIT_WINDOW",
+		"METRICS_ADDR", "OTEL_SERVICE_NAME", "OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_TRACES_SAMPLER_ARG", "DEPLOYMENT_ENVIRONMENT", "LOG_LEVEL",
 	} {
 		old, had := os.LookupEnv(key)
 		if err := os.Unsetenv(key); err != nil {
@@ -28,6 +29,45 @@ func clearEnvironment(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestObservabilityConfiguration(t *testing.T) {
+	for _, item := range []struct{ key, value string }{
+		{"METRICS_ADDR", "wrong"},
+		{"OTEL_EXPORTER_OTLP_ENDPOINT", "ftp://localhost:4318"},
+		{"OTEL_EXPORTER_OTLP_ENDPOINT", "http://user:secret@localhost:4318"},
+		{"OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318?token=secret"},
+		{"OTEL_TRACES_SAMPLER_ARG", "NaN"},
+		{"OTEL_TRACES_SAMPLER_ARG", "Inf"},
+		{"OTEL_TRACES_SAMPLER_ARG", "-0.1"},
+		{"OTEL_TRACES_SAMPLER_ARG", "1.1"},
+		{"LOG_LEVEL", "trace"},
+	} {
+		t.Run(item.key+"/"+item.value, func(t *testing.T) {
+			clearEnvironment(t)
+			t.Setenv("APP_MODE", "demo")
+			t.Setenv(item.key, item.value)
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), item.key) || strings.Contains(err.Error(), "secret") {
+				t.Fatalf("expected safe %s validation error, got %v", item.key, err)
+			}
+		})
+	}
+	t.Run("valid", func(t *testing.T) {
+		clearEnvironment(t)
+		t.Setenv("APP_MODE", "demo")
+		t.Setenv("METRICS_ADDR", "127.0.0.1:9091")
+		t.Setenv("OTEL_TRACES_SAMPLER_ARG", "0.25")
+		t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")
+		t.Setenv("LOG_LEVEL", "debug")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.TraceSampleRatio != 0.25 || cfg.LogLevel != "debug" || cfg.MetricsAddr != "127.0.0.1:9091" {
+			t.Fatalf("unexpected telemetry config: %+v", cfg)
+		}
+	})
 }
 
 func setProductionCredentials(t *testing.T) {
