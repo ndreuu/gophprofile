@@ -1,0 +1,12 @@
+groups:
+  - name: gophprofile-logs
+    rules:
+      - alert: GophProfileRepeatedErrorLogs
+        expr: 'sum(count_over_time({app="gophprofile",level="ERROR"}[5m])) > 5'
+        for: 2m
+        labels:
+          severity: warning
+          service: gophprofile
+        annotations:
+          summary: Repeated application errors in logs
+          description: More than 5 ERROR log entries in 5 minutes, sustained for 2 minutes; inspect Loki and the linked traces.

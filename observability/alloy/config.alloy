@@ -1,0 +1,50 @@
+logging {
+  level = "info"
+}
+
+discovery.docker "gophprofile" {
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "5s"
+  filter {
+    name   = "label"
+    values = ["gophprofile.logs=true"]
+  }
+}
+
+discovery.relabel "gophprofile" {
+  targets = discovery.docker.gophprofile.targets
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service_name"
+    replacement   = "gophprofile-$1"
+  }
+}
+
+// Docker's API unwraps the json-file log envelope; the line is slog JSON.
+loki.source.docker "gophprofile" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.gophprofile.output
+  labels     = { "app" = "gophprofile" }
+  forward_to = [loki.process.gophprofile.receiver]
+}
+
+loki.process "gophprofile" {
+  stage.json {
+    expressions = { "level" = "level" }
+  }
+  stage.labels {
+    values = { "level" = "" }
+  }
+  // trace_id, span_id and request_id remain JSON fields, not index labels.
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

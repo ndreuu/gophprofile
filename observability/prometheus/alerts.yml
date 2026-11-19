@@ -1,0 +1,39 @@
+groups:
+  - name: gophprofile
+    rules:
+      - alert: GophProfileHighHTTPErrorRatio
+        expr: |
+          (
+            sum(rate(gophprofile_http_requests_total{job="gophprofile-server",status=~"5.."}[5m]))
+            /
+            sum(rate(gophprofile_http_requests_total{job="gophprofile-server"}[5m]))
+          ) > 0.05
+          and sum(increase(gophprofile_http_requests_total{job="gophprofile-server"}[5m])) >= 20
+        for: 2m
+        labels:
+          severity: warning
+          service: server
+        annotations:
+          summary: HTTP 5xx ratio exceeds 5%
+          description: More than 5% of requests fail with HTTP 5xx over 5 minutes (at least 20 requests); sustained for 2 minutes.
+      - alert: GophProfileHighHTTPLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(gophprofile_http_request_duration_seconds_bucket{job="gophprofile-server"}[5m]))
+          ) > 0.5
+          and sum(increase(gophprofile_http_request_duration_seconds_count{job="gophprofile-server"}[5m])) >= 20
+        for: 2m
+        labels:
+          severity: warning
+          service: server
+        annotations:
+          summary: HTTP P95 latency exceeds 500 ms
+          description: At least 20 requests in 5 minutes and P95 above 500 ms; sustained for 2 minutes.
+      - alert: GophProfileTargetDown
+        expr: up{job=~"gophprofile-server|gophprofile-worker"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: GophProfile metrics target is unavailable
+          description: 'Prometheus cannot scrape {{ $labels.job }} at {{ $labels.instance }} for 1 minute.'

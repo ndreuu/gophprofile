@@ -23,12 +23,14 @@ jobs:
       - run: go build ./cmd/...
       - run: cp .env.example .env
       - run: docker compose config -q
-      - run: docker compose up --build -d --wait --wait-timeout 180
+      - run: make observability-check
+      - run: docker compose up --build -d --wait --wait-timeout 300
       - run: go test -race -tags=integration ./internal/adapters/postgres ./internal/adapters/s3
         env:
           POSTGRES_INTEGRATION_URL: postgres://gophprofile:gophprofile_dev@localhost:5432/gophprofile?sslmode=disable
           S3_INTEGRATION_ENDPOINT: localhost:9000
       - run: python3 scripts/smoke.py
+      - run: make observability-smoke
       - if: failure()
         run: docker compose logs --no-color
       - if: always()

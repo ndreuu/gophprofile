@@ -6,25 +6,52 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"path"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"gophprofile/internal/domain"
+	"gophprofile/internal/observability"
 )
 
 type Service struct {
 	repo      domain.Repository
 	storage   domain.Storage
 	processor domain.ImageProcessor
+	metrics   *observability.Metrics
 }
 
 func New(repo domain.Repository, storage domain.Storage, processor domain.ImageProcessor) *Service {
 	return &Service{repo: repo, storage: storage, processor: processor}
 }
 
-func (s *Service) Upload(ctx context.Context, userID, fileName string, data []byte) (domain.Avatar, error) {
+func (s *Service) WithMetrics(metrics *observability.Metrics) *Service {
+	s.metrics = metrics
+	return s
+}
+
+func (s *Service) Upload(ctx context.Context, userID, fileName string, data []byte) (avatar domain.Avatar, err error) {
+	ctx, span := otel.Tracer("gophprofile/service").Start(ctx, "avatar.upload")
+	defer span.End()
+	span.SetAttributes(attribute.Int("file.size", len(data)))
+	started := time.Now()
+	defer func() {
+		status := "success"
+		if err != nil {
+			status = "error"
+			observability.RecordError(span, err)
+		}
+		if s.metrics != nil {
+			s.metrics.ObserveUpload(status, time.Since(started).Seconds())
+		}
+		if err == nil {
+			slog.InfoContext(ctx, "avatar uploaded", "avatar_id", avatar.ID, "file_size", avatar.Size, "mime_type", avatar.MIMEType)
+		}
+	}()
 	if err := domain.ValidateUserID(userID); err != nil {
 		return domain.Avatar{}, err
 	}
@@ -44,7 +71,7 @@ func (s *Service) Upload(ctx context.Context, userID, fileName string, data []by
 	if fileName == "." || fileName == "/" || len(fileName) > 255 {
 		fileName = "avatar"
 	}
-	avatar := domain.Avatar{ID: id, UserID: userID, FileName: fileName, MIMEType: info.MIMEType,
+	avatar = domain.Avatar{ID: id, UserID: userID, FileName: fileName, MIMEType: info.MIMEType,
 		Size: int64(len(data)), S3Key: "originals/" + id, Dimensions: info.Dimensions,
 		Thumbnails: []domain.Thumbnail{}, Status: domain.StatusProcessing,
 		URL: "/api/v1/avatars/" + id, CreatedAt: now, UpdatedAt: now}
@@ -88,7 +115,10 @@ func (s *Service) List(ctx context.Context, userID string) ([]domain.Avatar, err
 	}
 	return s.repo.List(ctx, userID)
 }
-func (s *Service) Delete(ctx context.Context, id, userID string) error {
+func (s *Service) Delete(ctx context.Context, id, userID string) (err error) {
+	ctx, span := otel.Tracer("gophprofile/service").Start(ctx, "avatar.delete")
+	defer span.End()
+	defer func() { observability.RecordError(span, err) }()
 	if err := domain.ValidateAvatarID(id); err != nil {
 		return err
 	}

@@ -1,0 +1,70 @@
+rule_files:
+  - alerts.yml
+evaluation_interval: 1m
+tests:
+  - name: sustained server errors with sufficient traffic
+    interval: 1m
+    input_series:
+      - series: 'gophprofile_http_requests_total{job="gophprofile-server",status="200"}'
+        values: '0+90x10'
+      - series: 'gophprofile_http_requests_total{job="gophprofile-server",status="500"}'
+        values: '0+10x10'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: GophProfileHighHTTPErrorRatio
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: server
+            exp_annotations:
+              summary: HTTP 5xx ratio exceeds 5%
+              description: More than 5% of requests fail with HTTP 5xx over 5 minutes (at least 20 requests); sustained for 2 minutes.
+  - name: isolated errors do not page on tiny traffic
+    interval: 1m
+    input_series:
+      - series: 'gophprofile_http_requests_total{job="gophprofile-server",status="500"}'
+        values: '0+1x10'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: GophProfileHighHTTPErrorRatio
+        exp_alerts: []
+  - name: sustained slow requests
+    interval: 1m
+    input_series:
+      - series: 'gophprofile_http_request_duration_seconds_bucket{job="gophprofile-server",le="0.1"}'
+        values: '0+5x10'
+      - series: 'gophprofile_http_request_duration_seconds_bucket{job="gophprofile-server",le="0.5"}'
+        values: '0+80x10'
+      - series: 'gophprofile_http_request_duration_seconds_bucket{job="gophprofile-server",le="1"}'
+        values: '0+95x10'
+      - series: 'gophprofile_http_request_duration_seconds_bucket{job="gophprofile-server",le="+Inf"}'
+        values: '0+100x10'
+      - series: 'gophprofile_http_request_duration_seconds_count{job="gophprofile-server"}'
+        values: '0+100x10'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: GophProfileHighHTTPLatency
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: server
+            exp_annotations:
+              summary: HTTP P95 latency exceeds 500 ms
+              description: At least 20 requests in 5 minutes and P95 above 500 ms; sustained for 2 minutes.
+  - name: worker scrape failure
+    interval: 1m
+    input_series:
+      - series: 'up{job="gophprofile-worker",instance="worker:9091",service="worker"}'
+        values: '0+0x5'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: GophProfileTargetDown
+        exp_alerts:
+          - exp_labels:
+              job: gophprofile-worker
+              instance: worker:9091
+              service: worker
+              severity: critical
+            exp_annotations:
+              summary: GophProfile metrics target is unavailable
+              description: Prometheus cannot scrape gophprofile-worker at worker:9091 for 1 minute.

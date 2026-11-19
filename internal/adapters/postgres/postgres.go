@@ -11,6 +11,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
+
 	"gophprofile/internal/domain"
 	"gophprofile/migrations"
 )
@@ -75,9 +81,10 @@ const avatarColumns = `id::text, user_id::text, file_name::text, mime_type::text
     width, height, thumbnails, processing_status::text, created_at, updated_at, deleted_at`
 
 type storedThumbnail struct {
-	Size  string `json:"size"`
-	URL   string `json:"url"`
-	S3Key string `json:"s3_key"`
+	Size      string `json:"size"`
+	URL       string `json:"url"`
+	S3Key     string `json:"s3_key"`
+	SizeBytes int64  `json:"size_bytes,omitempty"`
 }
 
 func marshalThumbnails(thumbnails []domain.Thumbnail) ([]byte, error) {
@@ -115,7 +122,9 @@ func scanAvatar(row scanner) (domain.Avatar, error) {
 }
 
 // Create commits metadata and its upload event atomically.
-func (r *Repository) Create(ctx context.Context, avatar domain.Avatar, event domain.Event) error {
+func (r *Repository) Create(ctx context.Context, avatar domain.Avatar, event domain.Event) (err error) {
+	ctx, span := startDatabaseSpan(ctx, "create_avatar")
+	defer func() { finishDatabaseSpan(span, err) }()
 	thumbnails, err := marshalThumbnails(avatar.Thumbnails)
 	if err != nil {
 		return fmt.Errorf("encode thumbnails: %w", err)
@@ -141,17 +150,23 @@ func (r *Repository) Create(ctx context.Context, avatar domain.Avatar, event dom
 	return commit(ctx, tx, "create avatar")
 }
 
-func (r *Repository) Get(ctx context.Context, id string) (domain.Avatar, error) {
+func (r *Repository) Get(ctx context.Context, id string) (avatar domain.Avatar, err error) {
+	ctx, span := startDatabaseSpan(ctx, "get_avatar")
+	defer func() { finishDatabaseSpan(span, err) }()
 	return scanAvatar(r.pool.QueryRow(ctx, "SELECT "+avatarColumns+" FROM avatars WHERE id = $1 AND deleted_at IS NULL", id))
 }
 
 // Current returns the newest non-deleted avatar with a stable UUID tie-breaker.
-func (r *Repository) Current(ctx context.Context, userID string) (domain.Avatar, error) {
+func (r *Repository) Current(ctx context.Context, userID string) (avatar domain.Avatar, err error) {
+	ctx, span := startDatabaseSpan(ctx, "current_avatar")
+	defer func() { finishDatabaseSpan(span, err) }()
 	return scanAvatar(r.pool.QueryRow(ctx, "SELECT "+avatarColumns+` FROM avatars
         WHERE user_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC, id DESC LIMIT 1`, userID))
 }
 
-func (r *Repository) List(ctx context.Context, userID string) ([]domain.Avatar, error) {
+func (r *Repository) List(ctx context.Context, userID string) (result []domain.Avatar, err error) {
+	ctx, span := startDatabaseSpan(ctx, "list_avatars")
+	defer func() { finishDatabaseSpan(span, err) }()
 	rows, err := r.pool.Query(ctx, "SELECT "+avatarColumns+` FROM avatars
         WHERE user_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC, id DESC`, userID)
 	if err != nil {
@@ -173,7 +188,9 @@ func (r *Repository) List(ctx context.Context, userID string) ([]domain.Avatar, 
 }
 
 // SoftDelete serializes with processing so deletion includes every completed file.
-func (r *Repository) SoftDelete(ctx context.Context, id, userID string, event domain.Event) error {
+func (r *Repository) SoftDelete(ctx context.Context, id, userID string, event domain.Event) (err error) {
+	ctx, span := startDatabaseSpan(ctx, "soft_delete_avatar")
+	defer func() { finishDatabaseSpan(span, err) }()
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin delete: %w", err)
@@ -222,7 +239,9 @@ func storageKeys(avatar domain.Avatar) []string {
 
 // ProcessEvent atomically commits the inbox marker and successful work. Callback
 // writes to S3 must use deterministic keys because external writes cannot roll back.
-func (r *Repository) ProcessEvent(ctx context.Context, event domain.Event, handler domain.EventHandler) error {
+func (r *Repository) ProcessEvent(ctx context.Context, event domain.Event, handler domain.EventHandler) (err error) {
+	ctx, span := startDatabaseSpan(ctx, "process_event")
+	defer func() { finishDatabaseSpan(span, err) }()
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin processing: %w", err)
@@ -273,7 +292,7 @@ func (r *Repository) ProcessEvent(ctx context.Context, event domain.Event, handl
 
 // DispatchPending publishes one event while holding its outbox row lock. A lost
 // broker acknowledgement may cause redelivery; the worker's inbox handles it.
-func (r *Repository) DispatchPending(ctx context.Context, publish func(context.Context, domain.Event) error) (bool, error) {
+func (r *Repository) DispatchPending(ctx context.Context, publish func(context.Context, domain.Event) error) (dispatched bool, err error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return false, fmt.Errorf("begin outbox dispatch: %w", err)
@@ -293,6 +312,9 @@ func (r *Repository) DispatchPending(ctx context.Context, publish func(context.C
 	if err := json.Unmarshal(payload, &event); err != nil {
 		return false, fmt.Errorf("decode outbox event: %w", err)
 	}
+	ctx = propagation.TraceContext{}.Extract(ctx, propagation.MapCarrier(event.TraceContext))
+	ctx, span := startDatabaseSpan(ctx, "dispatch_outbox")
+	defer func() { finishDatabaseSpan(span, err) }()
 	if err := publish(ctx, event); err != nil {
 		return false, fmt.Errorf("publish outbox event: %w", err)
 	}
@@ -309,7 +331,12 @@ type executor interface {
 	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
 }
 
-func insertOutbox(ctx context.Context, tx executor, event domain.Event) error {
+func insertOutbox(ctx context.Context, tx executor, event domain.Event) (err error) {
+	ctx, span := startDatabaseSpan(ctx, "insert_outbox")
+	defer func() { finishDatabaseSpan(span, err) }()
+	carrier := propagation.MapCarrier{}
+	propagation.TraceContext{}.Inject(ctx, carrier)
+	event.TraceContext = carrier
 	payload, err := json.Marshal(event)
 	if err != nil {
 		return fmt.Errorf("encode outbox event: %w", err)
@@ -328,3 +355,37 @@ func commit(ctx context.Context, tx pgx.Tx, operation string) error {
 }
 
 func rollback(ctx context.Context, tx pgx.Tx) { _ = tx.Rollback(ctx) }
+
+func startDatabaseSpan(ctx context.Context, operation string) (context.Context, trace.Span) {
+	return otel.Tracer("gophprofile/postgres").Start(ctx, "postgresql "+operation,
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(attribute.String("db.system.name", "postgresql"), attribute.String("db.operation.name", operation)))
+}
+
+func finishDatabaseSpan(span trace.Span, err error) {
+	if err != nil {
+		span.RecordError(errors.New("PostgreSQL operation failed"))
+		span.SetStatus(codes.Error, "PostgreSQL operation failed")
+	}
+	span.End()
+}
+
+// ObservabilityStats reads the persistent active object bytes and pending outbox count.
+func (r *Repository) ObservabilityStats(ctx context.Context) (storageBytes int64, queueDepth int64, acquired, idle, total int32, err error) {
+	ctx, span := startDatabaseSpan(ctx, "observability_stats")
+	defer func() { finishDatabaseSpan(span, err) }()
+	err = r.pool.QueryRow(ctx, `SELECT
+  (SELECT COALESCE(sum(size_bytes + COALESCE((
+   SELECT sum(COALESCE((thumbnail->>'size_bytes')::bigint, 0))
+   FROM jsonb_array_elements(thumbnails) AS thumbnail
+  ), 0)), 0)::bigint FROM avatars WHERE deleted_at IS NULL),
+  (SELECT count(*) FROM outbox WHERE sent_at IS NULL)`).Scan(&storageBytes, &queueDepth)
+	if err != nil {
+		return 0, 0, 0, 0, 0, fmt.Errorf("read observability statistics: %w", err)
+	}
+	if pool, ok := r.pool.(*pgxpool.Pool); ok {
+		stats := pool.Stat()
+		acquired, idle, total = stats.AcquiredConns(), stats.IdleConns(), stats.TotalConns()
+	}
+	return storageBytes, queueDepth, acquired, idle, total, nil
+}

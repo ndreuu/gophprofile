@@ -8,7 +8,10 @@ import (
 	"log/slog"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"gophprofile/internal/domain"
+	"gophprofile/internal/observability"
 )
 
 type Worker struct {
@@ -18,6 +21,7 @@ type Worker struct {
 	attempts             int
 	baseDelay, timeLimit time.Duration
 	logger               *slog.Logger
+	metrics              *observability.Metrics
 }
 
 func New(repo domain.Repository, storage domain.Storage, processor domain.ImageProcessor, attempts int, baseDelay, maxDelay time.Duration, logger *slog.Logger) *Worker {
@@ -36,7 +40,27 @@ func New(repo domain.Repository, storage domain.Storage, processor domain.ImageP
 	return &Worker{repo: repo, storage: storage, processor: processor, attempts: attempts, baseDelay: baseDelay, timeLimit: maxDelay, logger: logger}
 }
 
-func (w *Worker) Handle(ctx context.Context, event domain.Event) error {
+func (w *Worker) WithMetrics(metrics *observability.Metrics) *Worker {
+	w.metrics = metrics
+	return w
+}
+
+func (w *Worker) Handle(ctx context.Context, event domain.Event) (err error) {
+	ctx, span := otel.Tracer("gophprofile/worker").Start(ctx, "avatar.process")
+	span.SetAttributes(attribute.String("messaging.message.id", event.ID))
+	defer span.End()
+	started := time.Now()
+	defer func() {
+		status := "success"
+		if err != nil {
+			status = "error"
+			observability.RecordError(span, err)
+		}
+		if w.metrics != nil {
+			w.metrics.ObserveWorker(event.Type, status, time.Since(started).Seconds())
+		}
+		w.logger.InfoContext(ctx, "background task completed", "message_id", event.ID, "event_type", event.Type, "status", status, "duration_seconds", time.Since(started).Seconds())
+	}()
 	if err := domain.ValidateEvent(event); err != nil {
 		return err
 	}
@@ -87,14 +111,14 @@ func (w *Worker) Handle(ctx context.Context, event domain.Event) error {
 				if err := w.storage.Put(ctx, key, bytes.NewReader(variant.Data), int64(len(variant.Data)), variant.MIMEType); err != nil {
 					return domain.JobResult{}, fmt.Errorf("store thumbnail: %w", err)
 				}
-				thumbs = append(thumbs, domain.Thumbnail{Size: variant.Size, S3Key: key, URL: fmt.Sprintf("/api/v1/avatars/%s?size=%s", avatar.ID, variant.Size)})
+				thumbs = append(thumbs, domain.Thumbnail{Size: variant.Size, S3Key: key, SizeBytes: int64(len(variant.Data)), URL: fmt.Sprintf("/api/v1/avatars/%s?size=%s", avatar.ID, variant.Size)})
 			}
 			return domain.JobResult{Thumbnails: thumbs, Status: domain.StatusCompleted}, nil
 		})
 		if last == nil {
 			return nil
 		}
-		w.logger.Warn("background task failed", "message_id", event.ID, "avatar_id", event.AvatarID, "attempt", attempt+1, "error", last)
+		w.logger.WarnContext(ctx, "background task failed", "message_id", event.ID, "avatar_id", event.AvatarID, "attempt", attempt+1, "error", last)
 		if attempt+1 < w.attempts {
 			if err := wait(ctx, delay); err != nil {
 				return err
@@ -128,7 +152,7 @@ func Dispatch(ctx context.Context, outbox domain.Outbox, publisher domain.Publis
 		sent, err := outbox.DispatchPending(publishCtx, publisher.Publish)
 		cancel()
 		if err != nil {
-			logger.Warn("outbox delivery postponed", "error", err)
+			logger.WarnContext(publishCtx, "outbox delivery postponed", "error", err)
 		}
 		if err != nil || !sent {
 			if wait(ctx, interval) != nil {

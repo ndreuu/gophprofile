@@ -15,6 +15,8 @@ type Options struct {
 	AllowedOrigins    []string
 	RateLimitRequests int
 	RateLimitWindow   time.Duration
+	Middleware        func(http.Handler) http.Handler
+	MetricsHandler    http.Handler
 }
 
 func defaultOptions(options []Options) Options {
