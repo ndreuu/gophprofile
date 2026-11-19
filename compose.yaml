@@ -118,7 +118,6 @@ services:
       - jaeger
 
   jaeger:
-    # 2.21 removed the legacy search API still used by Grafana's Jaeger plugin.
     image: cr.jaegertracing.io/jaegertracing/jaeger:2.20.0
     restart: unless-stopped
     mem_limit: 256m

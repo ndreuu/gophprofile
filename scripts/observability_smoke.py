@@ -114,7 +114,6 @@ def main():
         avatar_id = uploaded['id']
         route = base + '/api/v1/avatars/' + avatar_id
         eventually('worker completed the traced upload', lambda: read_json(route + '/metadata')['status'] == 'completed')
-        # Read a generated object to exercise the S3 download path as well.
         request(route + '?size=100x100', headers={'traceparent': traceparent})
 
         for metric in ['gophprofile_http_requests_total', 'gophprofile_http_request_duration_seconds_count',

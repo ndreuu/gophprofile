@@ -24,7 +24,6 @@ discovery.relabel "gophprofile" {
   }
 }
 
-// Docker's API unwraps the json-file log envelope; the line is slog JSON.
 loki.source.docker "gophprofile" {
   host       = "unix:///var/run/docker.sock"
   targets    = discovery.relabel.gophprofile.output
@@ -39,7 +38,6 @@ loki.process "gophprofile" {
   stage.labels {
     values = { "level" = "" }
   }
-  // trace_id, span_id and request_id remain JSON fields, not index labels.
   forward_to = [loki.write.local.receiver]
 }
 

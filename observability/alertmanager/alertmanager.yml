@@ -5,6 +5,5 @@ route:
   group_interval: 1m
   repeat_interval: 4h
 
-# Local development: alerts are visible in the UI; no external notifications.
 receivers:
   - name: local
