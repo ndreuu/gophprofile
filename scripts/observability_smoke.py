@@ -31,6 +31,11 @@ def read_json(url, **kwargs):
     return json.loads(request(url, **kwargs))
 
 
+def http_ready(url):
+    request(url)
+    return True
+
+
 def eventually(description, check, timeout=90):
     deadline = time.monotonic() + timeout
     last_error = None
@@ -80,7 +85,7 @@ def main():
         ('Alertmanager ready', alertmanager + '/-/ready'),
         ('Grafana health', args.grafana + '/api/health'),
     ]:
-        eventually(name, lambda url=url: request(url))
+        eventually(name, lambda url=url: http_ready(url))
 
     def prometheus_query(expression):
         data = read_json(args.prometheus + '/api/v1/query?' + urllib.parse.urlencode({'query': expression}))

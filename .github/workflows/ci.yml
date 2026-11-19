@@ -14,6 +14,7 @@ jobs:
           go-version-file: go.mod
           cache: true
       - run: go run scripts/check_comments.go
+      - run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - run: go test -race ./...
       - run: go test -race -tags=integration ./internal/adapters/kafka
       - run: make coverage
